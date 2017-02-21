@@ -41,6 +41,7 @@ packages:
 # (e.g., acme-missiles-0.3)
 extra-deps:
 - free-4.12.4
+- cereal-0.5.4.0
 
 # Override default flag values for local packages and extra-deps
 flags: {}

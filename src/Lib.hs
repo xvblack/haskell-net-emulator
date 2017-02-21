@@ -1,5 +1,5 @@
 {-# OPTIONS -fglasgow-exts #-}
-{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveFunctor, DeriveGeneric, DefaultSignatures #-}
 module Lib
     ( someFunc
     ) where
@@ -11,57 +11,72 @@ import qualified Control.Monad.Free as F
 import Control.Concurrent.MVar
 import Control.Monad (forM, forever)
 import Debug.Trace
+import Data.Serialize
+import GHC.Generics
 
 -- newtype EndpointAddress = EndpointAddress Int
 
-class (Show a) => Message a where
-  serialize :: a -> B.ByteString
-  deserialize :: B.ByteString -> a 
+-- class (Show a) => Message a where
+--   serialize :: a -> B.ByteString
+--   deserialize :: B.ByteString -> a 
 
-data AnyMessage = forall a. Message a => AnyMessage {unMessage :: a}
-instance Show AnyMessage where
-  show (AnyMessage m) = show m
+-- data AnyMessage = forall a. (Serialize a) => AnyMessage {unMessage :: a}
+-- instance Show AnyMessage where
+--   show (AnyMessage m) = show m
 
-instance Message String where
-  serialize = B.pack
-  deserialize = B.unpack
+-- instance Message String where
+--   serialize = B.pack
+--   deserialize = B.unpack
 
-data NetOp address next = 
-    Send address AnyMessage next
-  | Receive ((Maybe (address, B.ByteString)) -> next)
+class SerializableTo a b where
+  serialize :: a -> b
+  deserialize :: b -> a
+
+instance SerializableTo a a where
+  serialize = id
+  deserialize = id
+
+instance Serialize a => SerializableTo a B.ByteString where
+  serialize = runPut . put
+  deserialize = fromRight . runGet get where
+    fromRight (Right r) = r
+    fromRight (Left l) = error "Either is not Right"
+
+data NetOp address wire next = 
+    Send address wire next
+  | Receive ((Maybe (address, wire)) -> next)
   | WaitForMessage next
   | GetPeers ([address] -> next)
   | GetSelf (address -> next)
   deriving Functor
 
-type NetM address = F.Free (NetOp address)
+type NetM address wire = F.Free (NetOp address wire)
 
-send :: (Message m) => a -> m -> NetM a ()
-send addr msg = F.Free $ Send addr (AnyMessage msg) $ F.Pure ()
-receive :: (Message m) => NetM a (Maybe (a, m))
+send :: (SerializableTo m w) => a -> m -> NetM a w ()
+send addr msg = F.Free $ Send addr (serialize msg) $ F.Pure ()
+receive :: (SerializableTo m w) => NetM a w (Maybe (a, m))
 receive = F.Free $ Receive $ F.Pure . (fmap (\(a, b) -> (a, deserialize b))) 
-getPeers :: forall a . NetM a [a]
+getPeers :: forall a . forall w . NetM a w [a]
 getPeers = F.Free (GetPeers F.Pure)
-getSelf :: NetM a a
+getSelf :: forall a . forall w . NetM a w a
 getSelf = F.Free $ GetSelf F.Pure
+
+data MessageUnion = SimpleMessage {unSimpleMessage :: String} deriving (Show, Generic)
+instance Serialize MessageUnion 
+-- instance Message MessageUnion where
+--   serialize (SimpleMessage m) = B.pack m
+--   deserialize bs = SimpleMessage $ B.unpack bs
 
 program = do
   peers <- getPeers
   self <- getSelf
   forM peers $ \peer -> do
-    send peer $ "A" ++ show self
+    send peer $ SimpleMessage $ "A" ++ show self
   forever $ do
     receive >>= \m -> case m of
-      Nothing -> return ()
-      Just (peer, msg) -> do
-        traceM msg
-        send peer $ "Echo" ++ msg
-
-prettyM :: NetM Int () -> IO ()
-prettyM (F.Free (Send addr msg next)) = do
-  putStrLn $ "Send" ++ show msg ++ "To" ++ show addr
-  prettyM next
-prettyM _ = return ()
+      Just (peer, (SimpleMessage msg)) -> do
+        send peer $ SimpleMessage $ "Echo " ++ msg
+      otherwise -> return ()
 
 runRepeatly :: a -> (a -> IO a) -> IO ()
 runRepeatly a f = do
@@ -70,14 +85,16 @@ runRepeatly a f = do
 
 stepNumPerLoop = 10
 
-data EmulatorState = EmulatorState {messages :: M.Map Int (S.Seq (Int, B.ByteString))} 
-  deriving (Show)
+-- type EmulatorWireFormat = MessageUnion
+type EmulatorM w a = NetM Int w a
+
+data EmulatorState w = EmulatorState {messages :: M.Map Int (S.Seq (Int, w))} deriving (Show)
 
 emptyEmulatorState addrs = EmulatorState {
   messages = M.fromList $ zip addrs $ repeat S.empty
 }
 
-emulateM :: Int -> NetM Int () -> IO ()
+emulateM :: (Show w) => Int -> EmulatorM w () -> IO ()
 emulateM peerNum program = do
   let addrs = [1..peerNum]
   state <- newMVar $ emptyEmulatorState addrs
@@ -87,18 +104,18 @@ emulateM peerNum program = do
     putStrLn $ show currState
     return newContinuations
 
-emulateRoundM :: (MVar EmulatorState) -> [Int] -> [NetM Int ()] -> IO [NetM Int ()]
+emulateRoundM :: (MVar (EmulatorState w)) -> [Int] -> [EmulatorM w ()] -> IO [EmulatorM w ()]
 emulateRoundM state addrs programs = 
   forM (zip addrs programs) $ \(addr, program) ->
     let peers = filter (/= addr) addrs in 
       emulateIndividualMachine state addr peers stepNumPerLoop program
 
-emulateIndividualMachine :: (MVar EmulatorState) -> Int -> [Int] -> Int -> NetM Int () -> IO (NetM Int ())
+emulateIndividualMachine :: (MVar (EmulatorState w)) -> Int -> [Int] -> Int -> EmulatorM w () -> IO (EmulatorM w ())
 emulateIndividualMachine state addr peers stepNum program
   | stepNum == 0 = return program
   | otherwise = case program of
-      F.Free (Send destination (AnyMessage msg) next) -> do
-        modifyMVar_ state $ \state -> return $ state {messages = M.adjust (S.|> (addr, serialize $ msg)) destination $ messages state}
+      F.Free (Send destination bs next) -> do
+        modifyMVar_ state $ \state -> return $ state {messages = M.adjust (S.|> (addr, bs)) destination $ messages state}
         return next
       F.Free (Receive callback) -> do
         head <- modifyMVar state $ \state -> case M.lookup addr $ messages state of
@@ -115,4 +132,4 @@ emulateIndividualMachine state addr peers stepNum program
     
 
 someFunc :: IO ()
-someFunc = emulateM 10 program
+someFunc = emulateM 10 (program :: EmulatorM MessageUnion ())
