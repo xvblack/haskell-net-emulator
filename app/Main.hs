@@ -1,6 +1,6 @@
 module Main where
 
-import Lib
+import Emulator (emulate)
 
 main :: IO ()
-main = someFunc
+main = emulate

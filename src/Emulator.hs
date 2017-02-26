@@ -1,18 +1,28 @@
 {-# OPTIONS -fglasgow-exts #-}
-{-# LANGUAGE DeriveFunctor, DeriveGeneric, DefaultSignatures #-}
-module Lib
-    ( someFunc
+{-# LANGUAGE DeriveFunctor, DeriveGeneric, DefaultSignatures, AllowAmbiguousTypes #-}
+module Emulator
+    ( emulate
     ) where
 
 import qualified Data.ByteString.Char8 as B
 import qualified Data.Sequence as S
 import qualified Data.Map as M
 import qualified Control.Monad.Free as F
-import Control.Concurrent.MVar
+-- import Control.Concurrent.TMVar
 import Control.Monad (forM, forever)
 import Debug.Trace
 import Data.Serialize
 import GHC.Generics
+import Control.Concurrent.MonadIO
+import Control.Concurrent.STM.MonadIO hiding (modifyTMVar)
+import Network
+
+modifyTMVar :: MonadIO io => TMVar a -> (a -> (a, b)) -> io b
+modifyTMVar t f = atomically $ do
+                    x <- takeTMVarSTM t
+                    let (y, r) = f x
+                    seq y $ putTMVarSTM t y
+                    return r
 
 -- newtype EndpointAddress = EndpointAddress Int
 
@@ -78,7 +88,7 @@ program = do
         send peer $ SimpleMessage $ "Echo " ++ msg
       otherwise -> return ()
 
-runRepeatly :: a -> (a -> IO a) -> IO ()
+runRepeatly :: (Monad m) => a -> (a -> m a) -> m ()
 runRepeatly a f = do
   r <- f a
   runRepeatly r f
@@ -94,35 +104,23 @@ emptyEmulatorState addrs = EmulatorState {
   messages = M.fromList $ zip addrs $ repeat S.empty
 }
 
-emulateM :: (Show w) => Int -> EmulatorM w () -> IO ()
-emulateM peerNum program = do
-  let addrs = [1..peerNum]
-  state <- newMVar $ emptyEmulatorState addrs
-  runRepeatly (repeat program) $ \continuations -> do
-    newContinuations <- emulateRoundM state addrs continuations
-    currState <- readMVar state
-    putStrLn $ show currState
-    return newContinuations
-
-emulateRoundM :: (MVar (EmulatorState w)) -> [Int] -> [EmulatorM w ()] -> IO [EmulatorM w ()]
+emulateRoundM :: (Show w, MonadIO m, NetworkM m Int) => (TMVar (EmulatorState w)) -> [Int] -> [EmulatorM w ()] -> m [EmulatorM w ()]
 emulateRoundM state addrs programs = 
   forM (zip addrs programs) $ \(addr, program) ->
     let peers = filter (/= addr) addrs in 
-      emulateIndividualMachine state addr peers stepNumPerLoop program
+      emulateIndividualMachine state addr peers program
 
-emulateIndividualMachine :: (MVar (EmulatorState w)) -> Int -> [Int] -> Int -> EmulatorM w () -> IO (EmulatorM w ())
-emulateIndividualMachine state addr peers stepNum program
-  | stepNum == 0 = return program
-  | otherwise = case program of
+emulateIndividualMachine :: (Show w, MonadIO m, NetworkM m Int) => (TMVar (EmulatorState w)) -> Int -> [Int] -> EmulatorM w () -> m (EmulatorM w ())
+emulateIndividualMachine state addr peers program = case program of
       F.Free (Send destination bs next) -> do
-        modifyMVar_ state $ \state -> return $ state {messages = M.adjust (S.|> (addr, bs)) destination $ messages state}
+        modifyTMVar_ state $ \state -> state {messages = M.adjust (S.|> (addr, bs)) destination $ messages state}
         return next
       F.Free (Receive callback) -> do
-        head <- modifyMVar state $ \state -> case M.lookup addr $ messages state of
+        head <- modifyTMVar state $ \state -> case M.lookup addr $ messages state of
           Just seq -> case S.viewl seq of
-            head S.:< remains -> return $ (state {messages = M.adjust (const remains) addr $ messages state}, Just head)
-            S.EmptyL -> return (state, Nothing)
-          Nothing -> return (state, Nothing)
+            head S.:< remains -> (state {messages = M.adjust (const remains) addr $ messages state}, Just head)
+            S.EmptyL -> (state, Nothing)
+          Nothing -> (state, Nothing)
         return $ callback head
       F.Free (GetPeers callback) -> do
         return $ callback peers
@@ -130,6 +128,16 @@ emulateIndividualMachine state addr peers stepNum program
         return $ callback addr
       _ -> return $ return ()
     
+emulateM :: (Show w, MonadIO m, NetworkM m Int) => Int -> EmulatorM w () -> m ([EmulatorM w ()], [EmulatorM w ()] -> m [EmulatorM w ()])
+emulateM peerNum program = do
+  let addrs = [1..peerNum]
+  state <- newTMVar $ emptyEmulatorState addrs
+  return $ (,) (repeat program) $ \continuations -> do
+    newContinuations <- emulateRoundM state addrs continuations
+    currState <- readTMVar state
+    -- putStrLn $ show currState
+    return newContinuations
 
-someFunc :: IO ()
-someFunc = emulateM 10 (program :: EmulatorM MessageUnion ())
+
+emulate :: (MonadIO m, NetworkM m Int) => m ([EmulatorM MessageUnion ()], [EmulatorM MessageUnion ()] -> m [EmulatorM MessageUnion ()])
+emulate = emulateM 10 (program :: EmulatorM MessageUnion ())

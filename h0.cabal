@@ -15,13 +15,18 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib
+  exposed-modules:     Emulator, Network
   build-depends:       base >= 4.7 && < 5
                      , bytestring
                      , containers
                      , cereal
                      , free
+                     , monadIO
+                     , mtl
+                     , reflex
+                     , reflex-dom
   default-language:    Haskell2010
+  other-extensions:  TemplateHaskell
 
 executable h0-exe
   hs-source-dirs:      app
