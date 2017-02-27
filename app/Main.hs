@@ -1,6 +1,7 @@
 module Main where
 
-import Emulator (emulate)
+import Program (fromIdenticalProgram)
+import Visualizer (widget)
 
 main :: IO ()
-main = emulate
+main = widget
