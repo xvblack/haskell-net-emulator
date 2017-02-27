@@ -1,0 +1,1 @@
+open $(stack path | awk -F ':' '/^local-install-root/ {print $2}')/bin/h0-exe.jsexe/index.html
